@@ -12,6 +12,8 @@
 # síntoma secundario de ese bug, no un problema real de la password).
 # bcrypt solo, sin el wrapper de passlib, funciona sin problemas.
 
+import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -78,3 +80,36 @@ def decode_access_token(token: str) -> str:
         algorithms=[JWT_ALGORITHM]
     )
     return payload["sub"]
+
+
+# -----------------------------------------------------
+# Recuperación de contraseña
+# -----------------------------------------------------
+# FIX (recuperación de contraseña): el token que se manda por email es
+# de alta entropía (32 bytes random, url-safe), así que no hace falta
+# bcrypt para guardarlo -- alcanza con un hash simple (sha256). bcrypt
+# está pensado para passwords de baja entropía elegidas por humanos,
+# donde hace falta ser lento a propósito contra fuerza bruta; acá el
+# espacio de búsqueda ya es enorme por el propio token random.
+
+RESET_TOKEN_EXPIRATION_MINUTES = 30
+
+
+def generate_reset_token() -> tuple[str, str, datetime]:
+    """
+    Devuelve (token_crudo, token_hash, expira_en).
+    - token_crudo: se manda por email, nunca se guarda en la DB.
+    - token_hash: lo que se guarda en la DB, para poder verificar el
+      token sin guardar el valor real (igual criterio que con passwords
+      -- si la DB se filtra, el token no queda expuesto en texto plano).
+    """
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=RESET_TOKEN_EXPIRATION_MINUTES
+    )
+    return raw_token, token_hash, expires_at
+
+
+def hash_reset_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()

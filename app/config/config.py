@@ -23,3 +23,8 @@ JWT_SECRET_KEY = os.getenv(
 )
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRATION_MINUTES = 60 * 24 * 7  # 7 días
+
+# ---- Nuevas: recuperación de contraseña / email ----
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "onboarding@resend.dev")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")

@@ -46,3 +46,47 @@ class UserRepository:
     async def email_exists(self, email: str) -> bool:
         count = await self._collection.count_documents({"email": email})
         return count > 0
+
+    # -----------------------------------------------------
+    # Recuperación de contraseña
+    # -----------------------------------------------------
+
+    async def set_reset_token(self, user_id: str, token_hash: str, expires_at):
+        from bson import ObjectId
+        await self._collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {
+                "reset_token_hash": token_hash,
+                "reset_token_expires": expires_at.timestamp(),
+            }}
+        )
+
+    async def get_by_reset_token_hash(self, token_hash: str) -> dict | None:
+        import time
+        user = await self._collection.find_one({"reset_token_hash": token_hash})
+
+        if not user:
+            return None
+
+        # verificar expiración acá, no solo al guardar -- un token
+        # vencido no debe servir aunque siga en la DB (se limpia recién
+        # en el próximo uso o reset)
+        expires_at = user.get("reset_token_expires", 0)
+        if time.time() > expires_at:
+            return None
+
+        return user
+
+    async def clear_reset_token(self, user_id: str):
+        from bson import ObjectId
+        await self._collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$unset": {"reset_token_hash": "", "reset_token_expires": ""}}
+        )
+
+    async def update_password(self, user_id: str, password_hash: str):
+        from bson import ObjectId
+        await self._collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"password_hash": password_hash}}
+        )
