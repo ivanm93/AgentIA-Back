@@ -1,0 +1,19 @@
+# Backend web
+fastapi
+uvicorn[standard]
+
+# MongoDB (driver async)
+motor
+
+# Auth
+pyjwt
+bcrypt
+
+# Validación de datos / config
+pydantic
+pydantic-settings
+python-dotenv
+email-validator
+
+# Ya deberías tener estas (usadas por el código existente)
+httpx

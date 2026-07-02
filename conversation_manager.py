@@ -1,0 +1,3 @@
+class ConversationManager:
+
+    conversations = {}
