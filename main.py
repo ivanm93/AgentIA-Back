@@ -38,7 +38,10 @@ app = FastAPI(
 # en producción -- es un hueco de seguridad real.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://agent-ia-front-en5gcjyvk-ivanm-93.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
