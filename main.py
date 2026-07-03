@@ -40,7 +40,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "https://agent-ia-front-en5gcjyvk-ivanm-93.vercel.app",
+        "https://agent-ia-front.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
