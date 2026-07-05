@@ -1,0 +1,69 @@
+# backup_mongo.py
+#
+# MongoDB Atlas M0 (tier gratis) NO incluye backups automáticos -- es una
+# limitación real del tier, confirmada por la documentación oficial.
+# Además, Atlas pausa automáticamente los clusters gratis tras 30 días
+# sin actividad, así que además de la protección contra pérdida de
+# datos, tener un backup te cubre si en algún momento el cluster queda
+# inactivo mucho tiempo.
+#
+# Este script exporta todas las colecciones a archivos JSON usando el
+# formato "Extended JSON" de MongoDB (bson.json_util), que preserva
+# tipos especiales como ObjectId sin perder información -- a diferencia
+# de json.dumps() normal, que rompería con esos tipos.
+#
+# Uso:
+#   python backup_mongo.py
+#
+# Para automatizarlo (recomendado, ya que no hay backup automático):
+# en Windows, Programador de tareas -> Crear tarea básica -> Diaria ->
+# Acción: iniciar un programa -> apuntar a tu python.exe del venv con
+# este script como argumento.
+
+import os
+from datetime import datetime, timezone
+
+from pymongo import MongoClient
+from bson import json_util
+
+from app.config.config import MONGO_URI, MONGO_DB_NAME
+
+
+COLLECTIONS_TO_BACKUP = ["users", "profiles", "conversations", "messages"]
+BACKUP_ROOT = "backups"
+
+
+def run_backup():
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB_NAME]
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_dir = os.path.join(BACKUP_ROOT, timestamp)
+    os.makedirs(backup_dir, exist_ok=True)
+
+    print(f"\n=== Backup de MongoDB -- {timestamp} UTC ===\n")
+
+    total_documents = 0
+
+    for collection_name in COLLECTIONS_TO_BACKUP:
+        collection = db[collection_name]
+        documents = list(collection.find({}))
+
+        output_path = os.path.join(backup_dir, f"{collection_name}.json")
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(json_util.dumps(documents, indent=2))
+
+        print(f"  {collection_name}: {len(documents)} documentos -> {output_path}")
+        total_documents += len(documents)
+
+    print(f"\nTotal: {total_documents} documentos respaldados en {backup_dir}/")
+    print("\n⚠️  Recordá guardar esta carpeta en un lugar seguro (no solo en")
+    print("   el disco local -- si se te rompe la PC, se pierde el backup")
+    print("   también). Considerá subirla a un Drive/Dropbox periódicamente.")
+
+    client.close()
+
+
+if __name__ == "__main__":
+    run_backup()

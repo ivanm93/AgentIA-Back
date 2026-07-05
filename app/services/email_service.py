@@ -6,6 +6,9 @@
 
 import httpx
 from app.config.config import RESEND_API_KEY, EMAIL_FROM, FRONTEND_URL
+from app.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 async def send_password_reset_email(to_email: str, raw_token: str) -> bool:
@@ -33,5 +36,5 @@ async def send_password_reset_email(to_email: str, raw_token: str) -> bool:
         return response.status_code < 300
 
     except (httpx.TimeoutException, httpx.HTTPError) as e:
-        print(f"[EmailService] Error enviando email de reseteo: {e!r}")
+        logger.warning(f"Error enviando email de reseteo: {e!r}")
         return False

@@ -3,6 +3,9 @@ from app.memory.user_profile_manager import UserProfileManager
 from app.memory.memory_retriever import MemoryRetriever
 
 from app.llm.summarizer import Summarizer
+from app.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 from app.memory.memory_extractor import MemoryExtractor
 from app.llm.embedding_client import EmbeddingClient
 from app.memory.memory_consolidator import MemoryConsolidator
@@ -15,6 +18,12 @@ from app.memory.topic_builder import TopicBuilder
 import time
 
 class MemoryEngine:
+
+    # FIX (resumen de conversación): cada N mensajes que "caen" fuera de
+    # la ventana de contexto reciente (ConversationManager.max_messages),
+    # se genera/actualiza un resumen -- así ese contexto no se pierde
+    # sin dejar rastro cuando la conversación se alarga.
+    _SUMMARY_TRIGGER_INTERVAL = 10
 
     def __init__(self):
 
@@ -65,6 +74,16 @@ class MemoryEngine:
 
     async def create_conversation(self, user_id: str, title: str = "Nueva conversación") -> str:
         return await self._conversation.create_conversation(user_id, title)
+
+    # FIX (título automático): wrappers para que ChatService pueda saber
+    # si un mensaje es el primero de la conversación, y ponerle un
+    # título derivado de ese mensaje en vez de dejar "Nueva conversación"
+    # para siempre.
+    async def count_conversation_messages(self, conversation_id: str) -> int:
+        return await self._conversation.count_messages(conversation_id)
+
+    async def set_conversation_title(self, conversation_id: str, title: str):
+        await self._conversation.set_title(conversation_id, title)
 
     async def list_conversations(self, user_id: str) -> list:
         return await self._conversation.list_conversations(user_id)
@@ -153,7 +172,17 @@ class MemoryEngine:
         message,
         emotion
     ):
-        await self._conversation.add_user_message(conversation_id, message)
+        # FIX (bug real, no relacionado al resumen): antes se guardaba el
+        # mensaje del usuario ANTES de traer el historial, así que
+        # get_history() lo incluía como último ítem -- y PromptBuilder
+        # lo volvía a agregar aparte, mandando el mismo mensaje DOS VECES
+        # al modelo. Esto causaba respuestas raras tipo "hay una
+        # repetición innecesaria" -- el modelo no alucinaba, reaccionaba
+        # (mal) a una duplicación real que nosotros mismos introducíamos.
+        #
+        # Ahora se trae el historial PRIMERO (sin el mensaje actual
+        # todavía), y recién después se persiste -- así PromptBuilder es
+        # el único lugar que agrega el mensaje actual, una sola vez.
         await self._profile.apply_forgetting(user_id)
         query_embedding = await self._embedding.embed(message)
 
@@ -167,6 +196,8 @@ class MemoryEngine:
         history = await self._conversation.get_history(conversation_id)
         summary = await self._conversation.get_summary(conversation_id) or ""
         profile = await self._profile.get_profile(user_id)
+
+        await self._conversation.add_user_message(conversation_id, message)
 
         return history, summary, relevant_memory, profile
 
@@ -242,6 +273,41 @@ class MemoryEngine:
         await self._profile.set_facts(user_id, profile.get("facts", []))
         await self._profile.set_topics(user_id, profile.get("topics", []))
 
-        print("\n===== PROFILE =====")
-        print(profile)
-        print("===================\n")
+        # FIX (resumen de conversación): Summarizer existía como clase
+        # pero nunca se llamaba en ningún lado -- get_summary() siempre
+        # devolvía None, y en conversaciones largas todo lo anterior a
+        # los últimos `max_messages` se perdía sin ninguna compensación.
+        await self._maybe_update_summary(conversation_id)
+
+        # FIX: esto era un print() de debug que se colaba en TODOS los
+        # logs de producción, con el perfil completo en cada turno --
+        # mucho ruido. Ahora es nivel DEBUG, así que con el LOG_LEVEL
+        # por defecto (INFO) no aparece. Para volver a verlo mientras
+        # testeás localmente, seteá la variable de entorno:
+        #   LOG_LEVEL=DEBUG
+        logger.debug(f"Perfil actualizado para user_id={user_id}: {profile}")
+
+    async def _maybe_update_summary(self, conversation_id: str):
+        total_messages = await self._conversation.count_messages(conversation_id)
+        outside_window = total_messages - self._conversation.max_messages
+
+        if outside_window <= 0:
+            return
+
+        if outside_window % self._SUMMARY_TRIGGER_INTERVAL != 0:
+            return
+
+        older_messages = await self._conversation.get_messages_outside_recent_window(
+            conversation_id, keep_last=self._conversation.max_messages
+        )
+
+        if not older_messages:
+            return
+
+        summary = await self._summarizer.summarize(older_messages)
+
+        # Si falla (Ollama caído, timeout, etc.), no rompemos el flujo --
+        # simplemente no se actualiza el resumen esta vez, se reintenta
+        # en el próximo disparo.
+        if summary:
+            await self._conversation.set_summary(conversation_id, summary)

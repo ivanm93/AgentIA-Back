@@ -1,6 +1,6 @@
 # app/api/routers/auth.py
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.schemas.auth import (
     UserRegister,
@@ -21,17 +21,29 @@ from app.auth.security import (
 )
 from app.auth.dependencies import get_current_user_id
 from app.services.email_service import send_password_reset_email
+from app.core.rate_limiter import limiter
+from app.core.logging_config import get_logger
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = get_logger(__name__)
 
 
 def get_user_repository() -> UserRepository:
     return UserRepository()
 
 
+# FIX (rate limiting): límites por IP en los 4 endpoints más sensibles a
+# abuso -- sin esto, alguien podía probar miles de passwords por minuto
+# (fuerza bruta contra /login), crear cuentas en bucle (/register), o
+# bombardear el buzón de alguien con emails de reseteo
+# (/forgot-password). slowapi necesita que el endpoint reciba
+# `request: Request` para poder identificar de dónde viene cada llamada.
+
 @router.post("/register", response_model=TokenResponse)
+@limiter.limit("3/minute")
 async def register(
+    request: Request,
     data: UserRegister,
     users: UserRepository = Depends(get_user_repository),
 ):
@@ -49,7 +61,9 @@ async def register(
 
 
 @router.post("/login", response_model=TokenResponse)
+@limiter.limit("5/minute")
 async def login(
+    request: Request,
     data: UserLogin,
     users: UserRepository = Depends(get_user_repository),
 ):
@@ -98,7 +112,9 @@ async def me(
 # -----------------------------------------------------
 
 @router.post("/forgot-password", response_model=MessageResponse)
+@limiter.limit("3/minute")
 async def forgot_password(
+    request: Request,
     data: ForgotPasswordRequest,
     users: UserRepository = Depends(get_user_repository),
 ):
@@ -120,13 +136,15 @@ async def forgot_password(
 
     sent = await send_password_reset_email(data.email, raw_token)
     if not sent:
-        print(f"[auth] No se pudo enviar el email de reseteo a {data.email}")
+        logger.warning(f"No se pudo enviar el email de reseteo a {data.email}")
 
     return generic_response
 
 
 @router.post("/reset-password", response_model=MessageResponse)
+@limiter.limit("5/minute")
 async def reset_password(
+    request: Request,
     data: ResetPasswordRequest,
     users: UserRepository = Depends(get_user_repository),
 ):

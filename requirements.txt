@@ -8,6 +8,7 @@ motor
 # Auth
 pyjwt
 bcrypt
+slowapi
 
 # Validación de datos / config
 pydantic

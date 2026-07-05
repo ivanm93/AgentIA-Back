@@ -2,6 +2,9 @@ import re
 import json
 import httpx
 from app.config.config import OLLAMA_URL, OLLAMA_MODEL
+from app.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 VALID_EMOTIONS = [
@@ -78,13 +81,17 @@ neutral.
         except (httpx.TimeoutException, httpx.HTTPError) as e:
             # FIX: un timeout o error de red no debería tirar abajo todo el
             # flujo de chat. Se loguea y se cae a un valor neutral por defecto.
-            print(f"[EmotionDetector] Error consultando Ollama: {e!r}. "
-                  f"Usando emoción por defecto 'neutral'.")
+            logger.warning(
+                f"Error consultando Ollama: {e!r}. Usando emoción por "
+                f"defecto 'neutral'."
+            )
             return "neutral"
 
         except (KeyError, ValueError) as e:
-            print(f"[EmotionDetector] Respuesta inesperada de Ollama: {e!r}. "
-                  f"Usando emoción por defecto 'neutral'.")
+            logger.warning(
+                f"Respuesta inesperada de Ollama: {e!r}. Usando emoción "
+                f"por defecto 'neutral'."
+            )
             return "neutral"
 
         # con el schema forzado, content debería ser JSON tipo {"emotion": "..."}

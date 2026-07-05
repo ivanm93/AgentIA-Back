@@ -6,6 +6,17 @@
 
 import os
 
+# FIX: sin esto, un archivo .env en la raíz del proyecto NUNCA se carga
+# al entorno del proceso -- os.getenv() solo lee variables que YA están
+# en el entorno (las que pusiste con `set`/`export`, o las que Render
+# inyecta directamente). load_dotenv() es lo que efectivamente lee el
+# archivo .env y las agrega al entorno antes de que el resto del
+# archivo intente leerlas con os.getenv(). En Render esto no hace
+# falta (las variables de entorno se configuran directo en el panel),
+# pero para desarrollo local con un .env es imprescindible.
+from dotenv import load_dotenv
+load_dotenv()
+
 # ---- Ya deberían existir en tu config.py ----
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
@@ -28,3 +39,6 @@ JWT_EXPIRATION_MINUTES = 60 * 24 * 7  # 7 días
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "onboarding@resend.dev")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
+# ---- Nueva: búsqueda web (Tavily) ----
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")

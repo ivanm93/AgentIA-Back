@@ -8,6 +8,10 @@ from app.llm.emotion.emotion_style import get_emotion_style
 from app.memory.memory_engine import MemoryEngine
 from app.safety.risk_detector import RiskDetector
 from app.safety.crisis_response import CRISIS_RESPONSE_MESSAGE
+from app.core.logging_config import get_logger
+from app.llm.tools.web_search_tool import WEB_SEARCH_TOOL_SCHEMA, execute_web_search
+
+logger = get_logger(__name__)
 from app.safety.clinical_signal_detector import ClinicalSignalDetector
 
 
@@ -23,10 +27,21 @@ class ChatService:
         r"(?:^|(?<=[.!?]\s))(?:Validar|Reencuadrar|Escuchar)\b[^.!?]*[.!?]",
     )
 
+    # FIX: después de parchear esto tres veces con verbos específicos
+    # ("no puedo ayudarte", "no puedo continuar con esta conversación",
+    # "no puedo buscar información...") y seguir encontrando variantes
+    # nuevas que se escapaban, se generaliza el patrón: en vez de listar
+    # verbos, matchea CUALQUIER frase corta de "no puedo <algo>." al
+    # inicio, siempre que la respuesta COMPLETA sea básicamente eso (el
+    # anclaje con $ al final evita falsos positivos -- una respuesta
+    # real y sustanciosa que arranque con "no puedo comprarte un auto,
+    # pero puedo ayudarte a pensar un plan de ahorro..." NO matchea,
+    # porque sigue con contenido real después que no entra en los
+    # grupos opcionales de cierre).
     _GENERIC_REFUSAL_PATTERN = re.compile(
-        r"^\s*lo siento,?\s*(pero\s*)?no puedo (ayudarte|ayudar|hacer eso|"
-        r"hablar de eso|continuar con eso)[^.!?]*[.!?]\s*"
-        r"(si (necesitas|querés|quieres)[^.!?]*[.!?]\s*)?$",
+        r"^\s*lo siento,?\s*(pero\s*)?no puedo [^.!?]{0,80}[.!?]\s*"
+        r"(si (necesitas|querés|quieres)[^.!?]*[.!?]\s*)?"
+        r"(¿?hay algo m[aá]s[^.!?]*[.!?]\s*)?$",
         re.IGNORECASE
     )
 
@@ -69,8 +84,25 @@ class ChatService:
 
         if not conversation_id:
             conversation_id = await self.memory.create_conversation(user_id)
+            is_first_message = True
+        else:
+            existing_count = await self.memory.count_conversation_messages(conversation_id)
+            is_first_message = existing_count == 0
 
-        if self.risk_detector.detect(message):
+        is_crisis = self.risk_detector.detect(message)
+
+        # FIX (título automático): se deriva del primer mensaje de la
+        # conversación, en vez de dejar "Nueva conversación" para
+        # siempre. EXCEPCIÓN deliberada: si ese primer mensaje dispara
+        # el detector de riesgo, NO se usa como título -- dejaría una
+        # frase sensible visible permanentemente en el listado del
+        # sidebar (mismo criterio que ya aplicamos al no mostrar
+        # risk_events en crudo en la pantalla de perfil).
+        if is_first_message and not is_crisis:
+            title = self._derive_title(message)
+            await self.memory.set_conversation_title(conversation_id, title)
+
+        if is_crisis:
             await self._record_crisis_turn(user_id, conversation_id, message)
             await self.memory.mark_risk_event(user_id)
             return {
@@ -118,14 +150,18 @@ class ChatService:
             suggest_professional=bool(suggest_professional_category)
         )
 
-        answer = await self.client.chat(messages)
+        answer = await self.client.chat(
+            messages,
+            tools=[WEB_SEARCH_TOOL_SCHEMA],
+            tool_executors={"buscar_en_internet": execute_web_search},
+        )
 
         answer = self._strip_meta_comments(answer)
         answer = self._cap_questions(answer)
 
         if self._GENERIC_REFUSAL_PATTERN.match(answer.strip()):
-            print(
-                f"[ChatService] Rechazo genérico detectado y reemplazado. "
+            logger.warning(
+                f"Rechazo genérico detectado y reemplazado. "
                 f"Respuesta original del modelo: {answer!r}"
             )
             answer = self._REFUSAL_FALLBACK
@@ -149,6 +185,20 @@ class ChatService:
             "is_crisis_response": False,
             "conversation_id": conversation_id,
         }
+
+    def _derive_title(self, message: str, max_length: int = 45) -> str:
+        """
+        Deriva un título corto a partir del primer mensaje de la
+        conversación -- truncado en un límite de palabra (no corta una
+        palabra a la mitad), con "..." si hizo falta recortar.
+        """
+        text = message.strip()
+
+        if len(text) <= max_length:
+            return text
+
+        truncated = text[:max_length].rsplit(" ", 1)[0]
+        return f"{truncated}..."
 
     def _strip_meta_comments(self, text: str) -> str:
         cleaned = self._META_COMMENT_PATTERN.sub("", text)

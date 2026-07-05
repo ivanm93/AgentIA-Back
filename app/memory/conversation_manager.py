@@ -160,6 +160,45 @@ class ConversationManager:
         await self.touch_conversation(conversation_id)
 
     # -----------------------------------------------------
+    # FIX (resumen de conversación): soporte para saber cuántos mensajes
+    # tiene una conversación, y traer los que están "cayendo" fuera de
+    # la ventana de contexto reciente (get_history solo usa los últimos
+    # `max_messages`) -- esos son los que hay que resumir antes de que
+    # se pierdan sin dejar rastro.
+    # -----------------------------------------------------
+
+    async def count_messages(self, conversation_id: str) -> int:
+        return await self._messages.count_documents(
+            {"conversation_id": conversation_id}
+        )
+
+    async def get_messages_outside_recent_window(
+        self,
+        conversation_id: str,
+        keep_last: int = 12,
+    ) -> list:
+        """
+        Devuelve todos los mensajes de la conversación EXCEPTO los
+        últimos `keep_last` (los que ya están cubiertos por
+        get_history() como contexto directo del LLM). En orden
+        cronológico.
+        """
+        total = await self.count_messages(conversation_id)
+
+        if total <= keep_last:
+            return []
+
+        cursor = (
+            self._messages
+            .find({"conversation_id": conversation_id})
+            .sort("created_at", 1)
+            .limit(total - keep_last)
+        )
+        docs = await cursor.to_list(length=total - keep_last)
+
+        return [{"role": d["role"], "content": d["content"]} for d in docs]
+
+    # -----------------------------------------------------
     # Borrado
     # -----------------------------------------------------
 
