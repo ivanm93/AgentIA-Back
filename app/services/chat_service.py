@@ -166,7 +166,10 @@ class ChatService:
         answer = await self.client.chat(
             messages,
             tools=[WEB_SEARCH_TOOL_SCHEMA],
-            tool_executors={"buscar_en_internet": execute_web_search},
+            tool_executors=(
+                {"buscar_en_internet": execute_web_search}
+                if needs_search else None
+            ),
         )
 
         answer = self._strip_meta_comments(answer)
@@ -213,6 +216,20 @@ class ChatService:
 
         truncated = text[:max_length].rsplit(" ", 1)[0]
         return f"{truncated}..."
+    
+    _SEARCH_TRIGGER_KEYWORDS = re.compile(
+        r"\b(noticia|noticias|actualidad|hoy en día|"
+        r"tendencia|precio|cotizaci[oó]n|resultado|partido|clima|"
+        r"busca(r|me)?|googlea|averigua|qu[ée] pas[oó] con)\b",
+        re.IGNORECASE
+    )
+
+    def _should_offer_search(
+        self, message: str, emotion: str, clinical_categories: list
+    ) -> bool:
+        if emotion in {"tristeza", "ansiedad", "enojo"} or clinical_categories:
+            return False
+        return bool(self._SEARCH_TRIGGER_KEYWORDS.search(message))
 
     def _strip_meta_comments(self, text: str) -> str:
         cleaned = self._META_COMMENT_PATTERN.sub("", text)
