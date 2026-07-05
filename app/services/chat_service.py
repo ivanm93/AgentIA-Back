@@ -49,6 +49,19 @@ class ChatService:
         "Dale, sigamos. Contame lo que quieras, estoy para escucharte."
     )
 
+    # FIX: otra variante del mismo patrón de fondo (el modelo "narrando su
+    # propio proceso" en vez de responder directo) -- esta vez inventa que
+    # hubo "un problema con la respuesta anterior" (que no existió) y arma
+    # una respuesta corregida entre comillas. La buena noticia es que la
+    # respuesta real y usable está adentro de las comillas -- no hay que
+    # descartarla, solo extraerla, en vez de mostrarle al usuario todo el
+    # preámbulo de auto-crítica inventada.
+    _SELF_CORRECTION_PATTERN = re.compile(
+        r'^[^"“]{0,250}?(problema|error)[^"“]{0,120}(respuesta anterior|respuesta)'
+        r'[^"“]{0,120}[:\-]?\s*["“](?P<quoted>.+)["”]\s*$',
+        re.IGNORECASE | re.DOTALL
+    )
+
     # FIX (mood manual): mapeo de las etiquetas en español que muestra la
     # UI (selector de ánimo) hacia el set interno de 7 emociones que ya
     # usa EmotionDetector. "Perdido" no tiene un equivalente exacto --
@@ -158,6 +171,7 @@ class ChatService:
 
         answer = self._strip_meta_comments(answer)
         answer = self._cap_questions(answer)
+        answer = self._extract_self_correction(answer)
 
         if self._GENERIC_REFUSAL_PATTERN.match(answer.strip()):
             logger.warning(
@@ -234,6 +248,21 @@ class ChatService:
             result.append(sentence)
 
         return ' '.join(result)
+
+    def _extract_self_correction(self, text: str) -> str:
+        """
+        Si el modelo inventó un preámbulo tipo "hubo un problema con la
+        respuesta anterior" y armó una versión corregida entre comillas,
+        se extrae SOLO lo que está entre comillas (la respuesta real y
+        usable), descartando el preámbulo de auto-crítica inventada.
+        Si no matchea ese patrón, devuelve el texto sin tocar.
+        """
+        match = self._SELF_CORRECTION_PATTERN.match(text.strip())
+
+        if match:
+            return match.group("quoted").strip()
+
+        return text
 
     async def _record_crisis_turn(
         self, user_id: str, conversation_id: str, message: str
