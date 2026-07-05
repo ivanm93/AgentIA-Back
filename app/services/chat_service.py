@@ -163,9 +163,13 @@ class ChatService:
             suggest_professional=bool(suggest_professional_category)
         )
 
+        needs_search = self._should_offer_search(
+            message, emotion, clinical_categories
+        )
+
         answer = await self.client.chat(
             messages,
-            tools=[WEB_SEARCH_TOOL_SCHEMA],
+            tools=[WEB_SEARCH_TOOL_SCHEMA] if needs_search else None,
             tool_executors=(
                 {"buscar_en_internet": execute_web_search}
                 if needs_search else None
