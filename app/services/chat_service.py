@@ -163,9 +163,7 @@ class ChatService:
             suggest_professional=bool(suggest_professional_category)
         )
 
-        needs_search = self._should_offer_search(
-            message, emotion, clinical_categories
-        )
+        needs_search = await self._needs_web_search(message)
 
         answer = await self.client.chat(
             messages,
@@ -221,20 +219,6 @@ class ChatService:
         truncated = text[:max_length].rsplit(" ", 1)[0]
         return f"{truncated}..."
     
-    _SEARCH_TRIGGER_KEYWORDS = re.compile(
-        r"\b(noticia|noticias|actualidad|hoy en día|"
-        r"tendencia|precio|cotizaci[oó]n|resultado|partido|clima|"
-        r"busca(r|me)?|googlea|averigua|qu[ée] pas[oó] con)\b",
-        re.IGNORECASE
-    )
-
-    def _should_offer_search(
-        self, message: str, emotion: str, clinical_categories: list
-    ) -> bool:
-        if emotion in {"tristeza", "ansiedad", "enojo"} or clinical_categories:
-            return False
-        return bool(self._SEARCH_TRIGGER_KEYWORDS.search(message))
-
     def _strip_meta_comments(self, text: str) -> str:
         cleaned = self._META_COMMENT_PATTERN.sub("", text)
         cleaned = self._BARE_INFINITIVE_META_PATTERN.sub("", cleaned)
@@ -355,3 +339,40 @@ class ChatService:
         profile = await self.memory.get_profile(user_id)
         profile.pop("_id", None)
         return profile
+    
+    # FIX: reemplaza el enfoque de keywords -- una lista fija nunca
+    # generaliza bien ("cartelera", "estreno", "dólar", "restaurante
+    # abierto ahora" son infinitos casos nuevos que se escapan). En vez
+    # de eso, se le pregunta al propio modelo, con un prompt acotado a
+    # una sola pregunta de sí/no, sin herramientas ni contexto pesado --
+    # una tarea de clasificación simple donde el LLM es confiable, en
+    # vez de dejarle la decisión de usar o no una tool en medio de una
+    # respuesta larga (que es donde vimos que fallaba).
+    async def _needs_web_search(self, message: str) -> bool:
+        classifier_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Respondé ÚNICAMENTE con la palabra SI o NO, sin "
+                    "explicación ni puntuación adicional.\n\n"
+                    "¿El siguiente mensaje de un usuario requiere buscar "
+                    "información actual en internet para responder bien "
+                    "(noticias, precios, horarios, cartelera, resultados, "
+                    "clima, eventos, datos que cambian con el tiempo o "
+                    "que dependen de dónde/cuándo está la persona)?\n\n"
+                    "Los mensajes personales, emocionales, de charla "
+                    "general, o preguntas que se pueden responder con "
+                    "conocimiento general (sin necesidad de datos de HOY) "
+                    "son NO."
+                )
+            },
+            {"role": "user", "content": message}
+        ]
+
+        try:
+            raw = await self.client.chat(classifier_messages)
+        except Exception as e:
+            logger.warning(f"Error en clasificador de búsqueda: {e!r}")
+            return False  # ante la duda, no buscar -- es el modo seguro
+
+        return raw.strip().upper().startswith("SI")
