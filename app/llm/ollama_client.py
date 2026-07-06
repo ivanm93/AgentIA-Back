@@ -12,6 +12,7 @@ class OllamaClient:
         messages: list,
         tools: list | None = None,
         tool_executors: dict | None = None,
+        options: dict | None = None,
     ) -> str:
         """
         Si se pasan `tools` (schemas de function-calling) y el modelo
@@ -23,6 +24,16 @@ class OllamaClient:
         Si el modelo no pide ninguna herramienta (el caso normal, la
         gran mayoría de los mensajes), se comporta exactamente igual que
         antes: una sola llamada, devuelve el texto de la respuesta.
+
+        `options` (FIX): mapea directo al campo "options" que la API
+        nativa de Ollama ya soporta en el body (num_predict,
+        temperature, etc. -- ver docs de /api/chat). Antes este
+        parámetro no existía en la firma, aunque chat_service.py ya lo
+        llamaba con options={"num_predict": 5} para el clasificador de
+        búsqueda -- eso tiraba TypeError en cada llamada, y como
+        _needs_web_search() atrapa la excepción y devuelve False, el
+        efecto real era que la búsqueda web NUNCA se activaba, en
+        silencio.
         """
 
         tools = tools or []
@@ -35,6 +46,8 @@ class OllamaClient:
         }
         if tools:
             body["tools"] = tools
+        if options:
+            body["options"] = options
 
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
