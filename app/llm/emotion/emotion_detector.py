@@ -19,10 +19,26 @@ VALID_EMOTIONS = [
 
 
 class EmotionDetector:
+    """
+    FIX (independencia del túnel): antes esta clase llamaba a Ollama
+    directo por HTTP, sin pasar por GroqClient. Ahora intenta primero
+    con Groq (compartiendo groq_client y rate_limiter con ChatService
+    -- MISMA instancia, no una nueva, para que el cupo gratis de Groq
+    sea un solo contador real y no dos contadores que no se enteran
+    entre sí) y cae a Ollama (la lógica vieja, sin tocar) si no hay
+    cupo o si Groq falla en el momento.
 
-    async def detect(self, message: str, rule_emotions: list[str]):
+    groq_client y rate_limiter se inyectan desde ChatService en vez de
+    instanciarse acá adentro -- ver el comentario de arriba sobre por
+    qué el rate limiter tiene que ser compartido.
+    """
 
-        prompt = f"""
+    def __init__(self, groq_client, rate_limiter):
+        self._groq_client = groq_client
+        self._rate_limiter = rate_limiter
+
+    def _build_prompt(self, message: str, rule_emotions: list[str]) -> str:
+        return f"""
 Detectá la emoción principal del mensaje.
 
 Mensaje:
@@ -31,10 +47,39 @@ Mensaje:
 Emociones detectadas por reglas:
 {rule_emotions}
 
-Respondé con JSON indicando la emoción principal, usando exactamente uno
-de estos valores: enojo, tristeza, ansiedad, confusión, calma, alegría,
-neutral.
+Respondé ÚNICAMENTE con un JSON de la forma {{"emotion": "..."}},
+usando exactamente uno de estos valores: enojo, tristeza, ansiedad,
+confusión, calma, alegría, neutral. No agregues texto fuera del JSON.
 """
+
+    async def detect(self, message: str, rule_emotions: list[str]):
+        prompt = self._build_prompt(message, rule_emotions)
+        messages = [{"role": "user", "content": prompt}]
+
+        estimated_tokens = self._rate_limiter.estimate_tokens(messages)
+        allowed, reason = await self._rate_limiter.acquire(estimated_tokens)
+
+        if allowed:
+            try:
+                content = await self._groq_client.chat(
+                    messages,
+                    response_format={"type": "json_object"},
+                )
+                return self._extract_emotion(content)
+            except Exception as e:
+                logger.warning(
+                    f"Groq falló clasificando emoción -- cae a Ollama: {e!r}"
+                )
+        else:
+            logger.info(
+                f"Cupo de Groq agotado ({reason}) para clasificador de "
+                f"emoción -- cae a Ollama."
+            )
+
+        return await self._detect_with_ollama(message, rule_emotions)
+
+    async def _detect_with_ollama(self, message: str, rule_emotions: list[str]):
+        prompt = self._build_prompt(message, rule_emotions)
 
         # FIX (mejora C): se agrega un JSON schema con "enum" forzando la
         # respuesta a ser EXACTAMENTE una de las 7 emociones válidas. Esto
@@ -94,7 +139,11 @@ neutral.
             )
             return "neutral"
 
-        # con el schema forzado, content debería ser JSON tipo {"emotion": "..."}
+        return self._extract_emotion(content)
+
+    def _extract_emotion(self, content: str) -> str:
+        # con el schema forzado (Ollama) o el prompt explícito (Groq),
+        # content debería ser JSON tipo {"emotion": "..."}
         try:
             parsed = json.loads(content)
             emotion = parsed.get("emotion", "")
@@ -103,8 +152,8 @@ neutral.
         except (json.JSONDecodeError, AttributeError):
             pass
 
-        # fallback: si el schema no fue respetado por algún motivo,
-        # se recurre al parsing por regex sobre texto libre (igual que antes)
+        # fallback: si el JSON no fue respetado por algún motivo,
+        # se recurre al parsing por regex sobre texto libre
         return self._parse_emotion(content)
 
     def _parse_emotion(self, content: str) -> str:

@@ -104,7 +104,7 @@ class ChatService:
         self.rate_limiter = GroqRateLimiter()
         self.memory = MemoryEngine()
         self.prompt_builder = PromptBuilder()
-        self.emotion_detector = EmotionDetector()
+        self.emotion_detector = EmotionDetector(self.groq_client, self.rate_limiter)
         self.risk_detector = RiskDetector()
         self.clinical_detector = ClinicalSignalDetector()
 

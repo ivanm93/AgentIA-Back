@@ -37,6 +37,7 @@ class GroqClient:
         tools: list[dict] | None = None,
         tool_executors: dict | None = None,
         options: dict | None = None,
+        response_format: dict | None = None,
     ) -> str:
         if not self.api_key:
             raise RuntimeError(
@@ -51,6 +52,9 @@ class GroqClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+
+        if response_format:
+            payload["response_format"] = response_format
 
         # FIX: options viene con nombres estilo Ollama (num_predict) en
         # las llamadas existentes de chat_service.py (ver clasificador

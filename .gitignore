@@ -1,3 +1,5 @@
-python backup_mongo.py.env
 .env
-.env
+.env.backup
+__pycache__/
+*.pyc
+test/

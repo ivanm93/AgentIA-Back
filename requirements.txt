@@ -18,3 +18,4 @@ email-validator
 
 # Ya deberías tener estas (usadas por el código existente)
 httpx
+fastembed
