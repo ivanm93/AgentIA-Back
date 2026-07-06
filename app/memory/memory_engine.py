@@ -184,7 +184,26 @@ class MemoryEngine:
         # todavía), y recién después se persiste -- así PromptBuilder es
         # el único lugar que agrega el mensaje actual, una sola vez.
         await self._profile.apply_forgetting(user_id)
-        query_embedding = await self._embedding.embed(message)
+
+        # FIX (independencia de proveedor externo): embed() ahora llama
+        # a una API externa (Gemini) -- puede fallar por red, cupo
+        # agotado, timeout, etc. Antes esto rompía el request ENTERO con
+        # un 500 (lo vimos en producción con el túnel de Ollama caído).
+        # Ahora un fallo acá se loguea y el flujo sigue sin el embedding
+        # -- degradación, no caída total. (Nota aparte, sin tocar por
+        # ahora: query_embedding no se usa en ningún lado después de
+        # calcularse -- self._retriever.retrieve() recibe profile/message
+        # crudos, no el embedding. Parece una integración a medio hacer;
+        # se mantiene el cálculo por si acaso, pero vale la pena revisar
+        # si hace falta en absoluto.)
+        try:
+            query_embedding = await self._embedding.embed(message)
+        except Exception as e:
+            logger.warning(
+                f"Error generando embedding del mensaje -- se continúa "
+                f"sin él: {e!r}"
+            )
+            query_embedding = None
 
         profile = await self._profile.get_profile(user_id)
 
@@ -253,7 +272,22 @@ class MemoryEngine:
         current_topics = profile.get("topics", [])
 
         for topic in (extracted.get("topics") or []):
-            embedding = await self._embedding.embed(topic["value"])
+            # FIX (mismo criterio que en process()): un fallo generando
+            # el embedding del topic no debe tumbar el resto de
+            # after_response() -- el guardado de memoria de este turno
+            # es un "bonus" desde la perspectiva del usuario (la
+            # respuesta ya se le mandó antes de llegar acá). (Misma nota
+            # que arriba: `embedding` tampoco se usa después -- se pasa
+            # solo `[topic]`, no el embedding, a topic_builder.build().)
+            try:
+                embedding = await self._embedding.embed(topic["value"])
+            except Exception as e:
+                logger.warning(
+                    f"Error generando embedding de topic -- se continúa "
+                    f"sin él: {e!r}"
+                )
+                embedding = None
+
             current_topics = self._topic_builder.build(
                 current_topics,
                 [topic]

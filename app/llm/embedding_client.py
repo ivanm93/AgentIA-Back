@@ -1,50 +1,118 @@
 import asyncio
+import os
+import time
+from collections import deque
 
-from fastembed import TextEmbedding
+import httpx
 
 from app.core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+GEMINI_EMBED_URL_TEMPLATE = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent"
+)
+
+
+class _EmbeddingRateLimiter:
+    """
+    Limitador simple para el free tier de Gemini Embedding: 1.500
+    requests/día es la restricción real (el TPM de 10M es tan generoso
+    que no importa para este volumen de uso). Mismo espíritu que
+    GroqRateLimiter -- colchón de seguridad bajo el límite real, y
+    compartido a nivel de clase (no por instancia) para que sea un
+    solo contador real, sin importar cuántas veces se instancie
+    EmbeddingClient.
+    """
+
+    def __init__(self, rpd_limit: int | None = None):
+        self.rpd_limit = rpd_limit or int(os.getenv("GEMINI_EMBED_RPD_LIMIT", "1400"))
+        self._daily_count = 0
+        self._daily_date = self._today()
+        self._lock = asyncio.Lock()
+
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime())
+
+    async def acquire(self) -> bool:
+        async with self._lock:
+            today = self._today()
+            if today != self._daily_date:
+                self._daily_date = today
+                self._daily_count = 0
+
+            if self._daily_count >= self.rpd_limit:
+                return False
+
+            self._daily_count += 1
+            return True
+
 
 class EmbeddingClient:
     """
-    FIX (independencia del túnel): antes llamaba a Ollama vía HTTP
-    (OLLAMA_URL/api/embeddings) -- dependía de que el túnel de
-    Cloudflare estuviera levantado y con la URL actualizada en Render.
-    Ahora corre el modelo LOCAL, en el mismo proceso, vía fastembed
-    (ONNX Runtime -- no arrastra todo PyTorch, pensado para entornos
-    chicos como Render free tier). Cero llamadas de red para esto.
+    FIX (independencia de RAM en Render free tier): la versión anterior
+    corría el modelo LOCAL con fastembed -- funcionaba, pero el proceso
+    completo (FastAPI + Motor + ONNX Runtime + el modelo) superaba los
+    512MB del free tier de Render y el proceso moría por OOM,
+    reiniciándose solo (afectando a TODOS los usuarios conectados en
+    ese momento, no solo a quien disparó el mensaje).
 
-    Se pierde compatibilidad con los embeddings viejos generados por
-    Ollama (otro modelo, otra dimensión) -- decisión consciente, se
-    aceptó perder la memoria vieja en vez de migrarla.
+    Se vuelve a una API hosteada (Gemini Embedding, gemini-embedding-001)
+    -- decisión consciente de priorizar estabilidad del proceso sobre
+    "cero dependencias externas". Igual que con Groq, esto suma otra
+    API key y otro cupo gratis a vigilar (acá: 1.500 requests/día).
 
-    El modelo se carga UNA sola vez a nivel de clase (no por instancia)
-    -- cargarlo de nuevo en cada request sería carísimo en tiempo y
-    memoria. La primera vez que corre en un entorno nuevo (ej. primer
-    deploy en Render), fastembed descarga los pesos del modelo desde
-    Hugging Face (~0.22GB) -- eso requiere que Render tenga salida a
-    internet hacia huggingface.co en ese momento (no debería ser un
-    problema, a diferencia del túnel esto es una descarga única, no una
-    dependencia de cada request).
+    El rate limiter vive a nivel de CLASE (no de instancia) por el
+    mismo motivo que en GroqRateLimiter: si MemoryEngine crea un
+    EmbeddingClient() nuevo en cada llamada, el contador tiene que
+    seguir siendo el mismo para reflejar el cupo real de la cuenta.
     """
 
-    _MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    _model: TextEmbedding | None = None
+    _rate_limiter: _EmbeddingRateLimiter | None = None
 
-    def __init__(self):
-        if EmbeddingClient._model is None:
-            logger.info(f"Cargando modelo de embeddings local: {self._MODEL_NAME}")
-            EmbeddingClient._model = TextEmbedding(model_name=self._MODEL_NAME)
+    def __init__(self, model: str | None = None):
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        self.model = model or os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+        self._http = httpx.AsyncClient(timeout=30.0)
+
+        if EmbeddingClient._rate_limiter is None:
+            EmbeddingClient._rate_limiter = _EmbeddingRateLimiter()
 
     async def embed(self, text: str) -> list[float]:
-        # .embed() de fastembed es sync y CPU-bound -- se corre en un
-        # thread aparte para no bloquear el event loop de FastAPI
-        # mientras calcula (antes, con Ollama, el bloqueo lo evitaba
-        # httpx async porque la espera era de red, no de CPU local).
-        return await asyncio.to_thread(self._embed_sync, text)
+        if not self.api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY no configurada -- no se puede generar "
+                "el embedding."
+            )
 
-    def _embed_sync(self, text: str) -> list[float]:
-        vectors = list(self._model.embed([text]))
-        return vectors[0].tolist()
+        allowed = await EmbeddingClient._rate_limiter.acquire()
+        if not allowed:
+            raise RuntimeError(
+                "Cupo gratis diario de Gemini Embedding agotado "
+                f"({EmbeddingClient._rate_limiter.rpd_limit} requests/día)."
+            )
+
+        url = GEMINI_EMBED_URL_TEMPLATE.format(model=self.model)
+        payload = {
+            "model": f"models/{self.model}",
+            "content": {"parts": [{"text": text}]},
+        }
+
+        response = await self._http.post(
+            url,
+            headers={
+                "x-goog-api-key": self.api_key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if "embedding" not in data or "values" not in data["embedding"]:
+            raise ValueError(f"Gemini embedding error: {data}")
+
+        return data["embedding"]["values"]
+
+    async def aclose(self):
+        await self._http.aclose()
