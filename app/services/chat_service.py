@@ -1,6 +1,9 @@
+import asyncio
 import re
 
 from app.llm.ollama_client import OllamaClient
+from app.llm.groq_client import GroqClient
+from app.llm.rate_limiter import GroqRateLimiter
 from app.prompts.prompt_builder import PromptBuilder
 from app.llm.emotion.rule_detector import detect_by_rules
 from app.llm.emotion.emotion_detector import EmotionDetector
@@ -62,6 +65,22 @@ class ChatService:
         re.IGNORECASE | re.DOTALL
     )
 
+    # FIX: bug de "disculpa refleja sin sentido" -- el modelo a veces
+    # abre la respuesta con algo tipo "Lo siento, pero puedo hablar
+    # contigo sobre eso..." (se disculpa por algo que SÍ puede hacer).
+    # Ya existe una regla en system_prompt.py ("Sobre disculparte") que
+    # pide no hacer esto, pero como con los otros bugs de este archivo,
+    # el prompt solo no alcanza -- hace falta el backstop determinístico.
+    #
+    # El "pero" pegado a "lo siento" es la señal clave: una apertura
+    # empática genuina ("Lo siento mucho, debe ser difícil...") no
+    # suele encadenar "pero" ahí. Exigirlo evita pisar una empatía real
+    # -- este patrón NO debe tocar esos casos.
+    _LEADING_APOLOGY_PATTERN = re.compile(
+        r"^\s*lo siento,?\s+pero\s+",
+        re.IGNORECASE
+    )
+
     # FIX (mood manual): mapeo de las etiquetas en español que muestra la
     # UI (selector de ánimo) hacia el set interno de 7 emociones que ya
     # usa EmotionDetector. "Perdido" no tiene un equivalente exacto --
@@ -75,7 +94,14 @@ class ChatService:
     }
 
     def __init__(self):
+        # FIX (Groq): self.client (Ollama) se mantiene con dos roles:
+        # (1) fallback si Groq no tiene cupo o falla en el momento, y
+        # (2) motor del clasificador _needs_web_search, a propósito --
+        # es una tarea de sí/no barata y no vale la pena gastarle cupo
+        # gratis a Groq en eso, dejándolo libre para respuestas reales.
         self.client = OllamaClient()
+        self.groq_client = GroqClient()
+        self.rate_limiter = GroqRateLimiter()
         self.memory = MemoryEngine()
         self.prompt_builder = PromptBuilder()
         self.emotion_detector = EmotionDetector()
@@ -165,7 +191,7 @@ class ChatService:
 
         needs_search = await self._needs_web_search(message)
 
-        answer = await self.client.chat(
+        answer = await self._generate_answer(
             messages,
             tools=[WEB_SEARCH_TOOL_SCHEMA] if needs_search else None,
             tool_executors=(
@@ -184,14 +210,22 @@ class ChatService:
                 f"Respuesta original del modelo: {answer!r}"
             )
             answer = self._REFUSAL_FALLBACK
+        else:
+            answer = self._strip_leading_apology(answer)
 
-        await self.memory.after_response(
-            user_id,
-            conversation_id,
-            message,
-            answer,
-            emotion
-        )
+        try:
+            await self.memory.after_response(
+                user_id,
+                conversation_id,
+                message,
+                answer,
+                emotion
+            )
+        except Exception as e:
+            logger.error(
+                f"Error en after_response (memoria) -- la respuesta al "
+                f"usuario ya se generó bien y no debe perderse por esto: {e!r}"
+            )
 
         if suggest_professional_category:
             await self.memory.mark_professional_suggested(
@@ -219,6 +253,42 @@ class ChatService:
         truncated = text[:max_length].rsplit(" ", 1)[0]
         return f"{truncated}..."
     
+    # FIX (Groq + rate limiter): antes había una sola llamada directa a
+    # self.client.chat() (Ollama). Ahora se intenta primero con Groq
+    # (mejor modelo, sin los bugs erráticos del 8B local), pero
+    # protegido por el rate limiter -- si no hay cupo (RPM/TPM/RPD) o
+    # si Groq falla en el momento (network, 429 igual, etc.), cae a
+    # Ollama local sin que el usuario note nada distinto más que la
+    # latencia. El usuario NUNCA se queda sin respuesta por esto.
+    async def _generate_answer(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_executors: dict | None = None,
+    ) -> str:
+        estimated_tokens = GroqRateLimiter.estimate_tokens(messages)
+        allowed, reason = await self.rate_limiter.acquire(estimated_tokens)
+
+        if allowed:
+            try:
+                return await self.groq_client.chat(
+                    messages, tools=tools, tool_executors=tool_executors
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Groq falló pese a tener cupo disponible -- "
+                    f"cae a Ollama local: {e!r}"
+                )
+        else:
+            logger.info(
+                f"Cupo gratis de Groq agotado ({reason}) -- "
+                f"cae a Ollama local para esta respuesta."
+            )
+
+        return await self.client.chat(
+            messages, tools=tools, tool_executors=tool_executors
+        )
+
     def _strip_meta_comments(self, text: str) -> str:
         cleaned = self._META_COMMENT_PATTERN.sub("", text)
         cleaned = self._BARE_INFINITIVE_META_PATTERN.sub("", cleaned)
@@ -268,6 +338,37 @@ class ChatService:
             return match.group("quoted").strip()
 
         return text
+
+    def _strip_leading_apology(self, text: str) -> str:
+        """
+        Saca un "Lo siento, pero" vacío del inicio de la respuesta
+        (ej. "Lo siento, pero puedo ayudarte con eso" -> "Puedo
+        ayudarte con eso"), capitalizando la letra siguiente.
+
+        A diferencia de _GENERIC_REFUSAL_PATTERN (que reemplaza TODA
+        la respuesta por un fallback cuando es un rechazo genuino real),
+        acá solo se recorta el prefijo -- lo que viene después de "pero"
+        ya es contenido real y útil, no hace falta descartarlo.
+
+        Este método debe llamarse SOLO cuando _GENERIC_REFUSAL_PATTERN
+        ya determinó que no es un rechazo genuino -- si lo fuera, ese
+        caso ya se resolvió reemplazando toda la respuesta antes de
+        llegar acá.
+        """
+        match = self._LEADING_APOLOGY_PATTERN.match(text)
+
+        if not match:
+            return text
+
+        remainder = text[match.end():]
+
+        if not remainder:
+            # No debería pasar en la práctica (matchear "lo siento,
+            # pero" y no dejar nada después) -- pero si pasa, mejor
+            # devolver el texto original que una respuesta vacía.
+            return text
+
+        return remainder[0].upper() + remainder[1:]
 
     async def _record_crisis_turn(
         self, user_id: str, conversation_id: str, message: str
@@ -348,6 +449,7 @@ class ChatService:
     # una tarea de clasificación simple donde el LLM es confiable, en
     # vez de dejarle la decisión de usar o no una tool en medio de una
     # respuesta larga (que es donde vimos que fallaba).
+    
     async def _needs_web_search(self, message: str) -> bool:
         classifier_messages = [
             {
@@ -370,9 +472,41 @@ class ChatService:
         ]
 
         try:
-            raw = await self.client.chat(classifier_messages)
+            raw = await self.client.chat(
+                classifier_messages,
+                options={"num_predict": 5}
+            )
         except Exception as e:
             logger.warning(f"Error en clasificador de búsqueda: {e!r}")
-            return False  # ante la duda, no buscar -- es el modo seguro
+            return False
 
         return raw.strip().upper().startswith("SI")
+    
+    # FIX (background memory): after_response ya no bloquea la respuesta
+    # al usuario. Antes, si el MemoryExtractor tardaba o fallaba, el
+    # usuario se quedaba esperando (o directamente recibía un 500) por
+    # un paso que es "bonus" desde su perspectiva -- él ya tiene su
+    # respuesta generada, guardar la memoria puede pasar en paralelo sin
+    # que lo note. El try/except adentro asegura que un fallo acá nunca
+    # se propague -- como corre en background, una excepción sin capturar
+    # quedaría silenciosa en el event loop, así que se loguea explícito.
+    async def _safe_after_response(
+        self,
+        user_id: str,
+        conversation_id: str,
+        message: str,
+        answer: str,
+        emotion: str,
+    ):
+        try:
+            asyncio.create_task(
+            self._safe_after_response(
+                user_id, conversation_id, message, answer, emotion
+            )
+        )
+        except Exception as e:
+            logger.error(
+                f"Error en after_response (memoria, background) -- "
+                f"la respuesta al usuario ya se había enviado antes de "
+                f"este fallo, no se ve afectada: {e!r}"
+            )

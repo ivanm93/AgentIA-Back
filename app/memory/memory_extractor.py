@@ -251,7 +251,7 @@ RESPONDE SOLO JSON, SIN explicaci√≥n, SIN razonamiento, SIN texto antes o despu√
             ],
         }
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
                 f"{OLLAMA_URL}/api/chat",
                 json={
